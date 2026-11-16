@@ -1,0 +1,9 @@
+[package]
+name = "phoenix"
+version = "0.1.0"
+description = "Safe bindings for Phoenix-RTOS native APIs"
+edition.workspace = true
+license.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("libphoenix_nommu"))'] }

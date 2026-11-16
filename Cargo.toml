@@ -1,0 +1,23 @@
+# Rust libraries and components for Phoenix-RTOS.
+#
+# One workspace, so the crates share a Cargo.lock and depend on each other
+# through [workspace.dependencies]: a member writes `phoenix.workspace = true`
+# and gets the copy in this repository. The `version` next to each
+# `path` is what a published crate would depend on instead, so publishing a
+# library to crates.io needs no change here.
+
+[workspace]
+resolver = "2"
+members = ["phoenix", "rsramfs"]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+phoenix = { path = "phoenix", version = "0.1" }
+
+[profile.release]
+# The build system strips separately and keeps the unstripped copy in
+# _build/<target>/prog, so keep the symbols here.
+debug = true

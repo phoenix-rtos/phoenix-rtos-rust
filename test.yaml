@@ -1,0 +1,11 @@
+# The tests of the Rust crates, built by `build.sh test` with RUST_ENABLE=y and
+# installed as test-<crate> (see phoenix-rtos-build/RUST.md)
+test:
+  type: libtest
+  requires: [RUST_ENABLE]
+  tests:
+    - name: phoenix
+      execute: test-phoenix
+
+    - name: rsramfs
+      execute: test-rsramfs

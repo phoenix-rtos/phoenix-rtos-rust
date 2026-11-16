@@ -1,0 +1,10 @@
+[package]
+name = "rsramfs"
+version = "0.1.0"
+description = "A RAM filesystem server"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+phoenix.workspace = true
