@@ -17,6 +17,7 @@ impl Errno {
     pub const EBUSY: Errno = Errno(16);
     pub const EEXIST: Errno = Errno(17);
     pub const EXDEV: Errno = Errno(18);
+    pub const ENODEV: Errno = Errno(19);
     pub const ENOTDIR: Errno = Errno(20);
     pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);

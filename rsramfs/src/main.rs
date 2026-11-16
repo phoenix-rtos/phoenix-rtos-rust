@@ -174,7 +174,7 @@ impl RamFs {
             Request::Unlink { dir, name } => self.unlink(self.ino(dir)?, name).map(done),
             Request::Readdir { dir, offset, out } => out.write(self.readdir(self.ino(dir)?, offset)?).map(done),
             Request::StatFs { out, .. } => out.write(self.statfs()).map(done),
-            Request::Other { .. } => Err(Errno::ENOSYS),
+            Request::Mount { .. } | Request::Other { .. } => Err(Errno::ENOSYS),
         }
     }
 
@@ -480,7 +480,10 @@ impl RamFs {
             1 => (OsStr::new(".."), d.parent),
             n => d.entries.iter().nth(n - 2).map(|(name, &ino)| (name.as_os_str(), ino)).ok_or(Errno::ENOENT)?,
         };
-        Ok(Dirent { ino: ino.into(), file_type: self.inode(ino)?.file_type(), reclen: 1, name })
+        // `d_ino` is 64-bit everywhere, `Ino` (`id_t`) only on some targets
+        #[allow(clippy::useless_conversion)]
+        let ino64 = u64::from(ino);
+        Ok(Dirent { ino: ino64, file_type: self.inode(ino)?.file_type(), reclen: 1, name })
     }
 
     pub fn statfs(&self) -> Statvfs {
@@ -492,6 +495,8 @@ impl RamFs {
             f_bfree: free,
             f_bavail: free,
             f_files: self.inodes.len() as u64,
+            // `c_ulong`: a no-op on 32-bit targets
+            #[allow(clippy::useless_conversion)]
             f_fsid: self.port.into(),
             f_namemax: NAME_MAX as _,
             ..Statvfs::default()
@@ -665,7 +670,9 @@ mod tests {
 
         assert_eq!(fs.getattr(ROOT, AttrType::Links), Ok(3));
         assert_eq!(fs.getattr(d, AttrType::Links), Ok(2));
-        assert_eq!(fs.readdir(d, 1).unwrap().ino, ROOT.into(), "'..' of dir");
+        #[allow(clippy::useless_conversion)] // as in readdir()
+        let root = u64::from(ROOT);
+        assert_eq!(fs.readdir(d, 1).unwrap().ino, root, "'..' of dir");
     }
 
     #[test]

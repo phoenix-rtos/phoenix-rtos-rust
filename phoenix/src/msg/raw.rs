@@ -29,6 +29,9 @@ pub const MT_LINK: c_int = 12;
 pub const MT_UNLINK: c_int = 13;
 pub const MT_READDIR: c_int = 14;
 pub const MT_STAT: c_int = 0xf53;
+/* <sys/file.h> */
+pub const MT_MOUNT: c_int = 0xf50;
+pub const MT_UMOUNT: c_int = 0xf51;
 
 /// `i.io.mode` of a write to a file opened with `O_APPEND` (posix-fcntl.h).
 pub const O_APPEND: u32 = 0x8;
@@ -66,6 +69,7 @@ pub union IArgs {
     pub attr: AttrArgs,
     pub ln_oid: Oid,
     pub readdir_offs: i64,
+    pub mount: MountArgs,
     pub raw: [u8; 64],
 }
 
@@ -83,6 +87,15 @@ pub struct LookupOut {
     pub dev: Oid,
 }
 
+/// `mount_i_msg_t` (`<sys/file.h>`): what `mtMount` carries in `i.raw`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MountArgs {
+    pub mnt: Oid,
+    pub mode: c_ulong,
+    pub fstype: [c_char; 16],
+}
+
 /// The reply arguments: the anonymous union in `msg_t.o`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -91,6 +104,8 @@ pub union OArgs {
     /// `o.io.offs`: the offset after the bytes a write took.
     pub io_offs: i64,
     pub create_oid: Oid,
+    /// `mount_o_msg_t`: the root of what `mtMount` mounted.
+    pub mount_oid: Oid,
     pub lookup: LookupOut,
     pub raw: [u8; 64],
 }

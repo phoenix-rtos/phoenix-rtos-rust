@@ -8,7 +8,7 @@
 
 [workspace]
 resolver = "2"
-members = ["phoenix", "rsramfs"]
+members = ["phoenix", "rsramfs", "umass"]
 
 [workspace.package]
 edition = "2021"
@@ -21,3 +21,7 @@ phoenix = { path = "phoenix", version = "0.1" }
 # The build system strips separately and keeps the unstripped copy in
 # _build/<target>/prog, so keep the symbols here.
 debug = true
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

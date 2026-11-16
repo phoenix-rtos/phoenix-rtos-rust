@@ -40,7 +40,7 @@ mod types;
 
 pub use client::{lookup, Message, MsgType, Mount, Resolved, Response};
 pub use raw::{AttrAll, Statvfs};
-pub use server::{CreateKind, Dirent, DirentOut, Out, Plain, Port, Reply, Request};
+pub use server::{CreateKind, Dirent, DirentOut, Out, Plain, Port, Received, Reply, Request};
 pub use types::{AttrType, FileType, ObjectType, POLL_READY};
 
 #[cfg(test)]

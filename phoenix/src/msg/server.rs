@@ -1,7 +1,7 @@
 use super::raw::{self, RawMsg};
 use super::{AttrAll, AttrType, FileType, ObjectType, Statvfs};
 use crate::{Errno, Id, Oid, Result};
-use core::ffi::c_void;
+use core::ffi::{c_int, c_ulong, c_void};
 use core::marker::PhantomData;
 use core::mem::size_of;
 use std::ffi::OsStr;
@@ -54,24 +54,74 @@ impl Port {
     where
         F: FnMut(Request<'_>) -> Result<Reply>,
     {
+        while let Some(mut received) = self.receive()? {
+            let reply = handler(received.request());
+            received.reply(reply);
+            // A failure means the sender is gone, which is no reason to stop.
+            let _ = self.respond(received);
+        }
+        Ok(())
+    }
+
+    /// Receives one message, to be answered with [`respond`](Port::respond),
+    /// possibly by another thread. `None` once the port is closed.
+    pub fn receive(&self) -> Result<Option<Received>> {
         // Boxed so it cannot move while the kernel's pointers into it are live.
         let mut msg = Box::new(RawMsg::zeroed());
         loop {
             let mut rid = 0;
             // SAFETY: `msg` and `rid` are valid out-pointers.
             match Errno::check(unsafe { raw::msgRecv(self.id, &mut *msg, &mut rid) }) {
-                Ok(_) => {}
+                Ok(_) => return Ok(Some(Received { msg, rid })),
                 Err(Errno::EINTR) => continue,
-                Err(_) if self.closed.load(Ordering::SeqCst) => return Ok(()),
+                Err(_) if self.closed.load(Ordering::SeqCst) => return Ok(None),
                 Err(e) => return Err(e),
             }
-            // SAFETY: just filled in by msgRecv, and it stays in place.
-            let reply = handler(unsafe { Request::from_raw(&mut msg) });
-            reply_into(&mut msg, reply);
-            // SAFETY: `msg` is the message received for `rid`. A failure here
-            // means the sender is gone, which is no reason to stop serving.
-            let _ = unsafe { raw::msgRespond(self.id, &mut *msg, rid) };
         }
+    }
+
+    /// Sends back the response of a message this port received. `Err` if the
+    /// sender is gone.
+    pub fn respond(&self, mut received: Received) -> Result<()> {
+        // SAFETY: `received.msg` is the message msgRecv() filled in for
+        // `received.rid` on this port, still in place in its box.
+        Errno::check(unsafe { raw::msgRespond(self.id, &mut *received.msg, received.rid) }).map(drop)
+    }
+}
+
+/// A message received by [`Port::receive`]; its sender waits until it is
+/// passed to [`Port::respond`], so it must not be dropped instead.
+pub struct Received {
+    msg: Box<RawMsg>,
+    rid: c_int,
+}
+
+// SAFETY: the message's buffers belong to this process (the kernel maps the
+// sender's memory in until the response), not to the receiving thread.
+unsafe impl Send for Received {}
+
+impl Received {
+    /// The message decoded; its buffers borrow `self`.
+    pub fn request(&mut self) -> Request<'_> {
+        // SAFETY: filled in by msgRecv() and kept in place in its box; the
+        // returned request borrows `self`, so nothing else touches it meanwhile.
+        unsafe { Request::from_raw(&mut self.msg) }
+    }
+
+    /// Puts `reply` in the message, to be sent by [`Port::respond`].
+    pub fn reply(&mut self, reply: Result<Reply>) {
+        reply_into(&mut self.msg, reply);
+    }
+
+    /// The message as received, for handing to C code that takes a `msg_t`.
+    pub fn raw(&mut self) -> &mut RawMsg {
+        &mut self.msg
+    }
+}
+
+impl core::fmt::Debug for Received {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Received {{ type: {}, rid: {} }}", self.msg.typ, self.rid)
     }
 }
 
@@ -125,6 +175,9 @@ pub enum Request<'a> {
     /// marks the end.
     Readdir { dir: Oid, offset: i64, out: DirentOut<'a> },
     StatFs { oid: Oid, out: Out<'a, Statvfs> },
+    /// Mount a filesystem of type `fstype` from the device `oid`. Reply with
+    /// [`Reply::Mounted`].
+    Mount { oid: Oid, fstype: &'a OsStr, mode: c_ulong },
     /// `mtDevCtl`, or a message type this crate does not decode.
     Other { msg_type: i32, oid: Oid },
 }
@@ -175,6 +228,12 @@ impl<'a> Request<'a> {
                 raw::MT_UNLINK => Request::Unlink { dir: oid, name: split_cstr(data).0 },
                 raw::MT_READDIR => Request::Readdir { dir: oid, offset: args.readdir_offs, out: DirentOut::new(buf) },
                 raw::MT_STAT => Request::StatFs { oid, out: Out::new(buf) },
+                raw::MT_MOUNT => {
+                    // From the message itself (not the copy in `args`), so
+                    // the name can borrow it like `data` does.
+                    let fstype: &'a [u8] = slice((&raw const msg.i.args.mount.fstype).cast(), 16);
+                    Request::Mount { oid, fstype: split_cstr(fstype).0, mode: args.mount.mode }
+                }
                 msg_type => Request::Other { msg_type, oid },
             }
         }
@@ -195,6 +254,8 @@ pub enum Reply {
     /// stops early at a mountpoint or device, `dev` is where the kernel
     /// continues with the rest; otherwise it is `file` itself.
     Lookup { consumed: usize, file: Oid, dev: Oid },
+    /// The root of what a [`Request::Mount`] mounted.
+    Mounted(Oid),
 }
 
 fn reply_into(msg: &mut RawMsg, reply: Result<Reply>) {
@@ -209,6 +270,10 @@ fn reply_into(msg: &mut RawMsg, reply: Result<Reply>) {
         }
         Ok(Reply::Created(oid)) => {
             msg.o.args.create_oid = oid;
+            0
+        }
+        Ok(Reply::Mounted(oid)) => {
+            msg.o.args.mount_oid = oid;
             0
         }
         Ok(Reply::Attr(val)) => {

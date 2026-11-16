@@ -1,0 +1,31 @@
+[package]
+name = "umass"
+version = "0.1.0"
+description = "USB Mass Storage class driver (Bulk-Only Transport, SCSI)"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `umass-rs` while the C driver still installs `umass`
+[[bin]]
+name = "umass-rs"
+path = "src/main.rs"
+
+[features]
+# Mounts ext2 through the C libext2, which has to be linked in (the Makefile
+# does on ia32, as the C driver's UMASS_MOUNT_EXT2)
+ext2 = []
+# Logs the driver threads' deepest stack use every few seconds, for sizing
+# them (i386: relies on there being no red zone)
+stack-report = []
+
+[dependencies]
+phoenix.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# Phoenix's target_os and target_env, unknown to compilers other than the Phoenix one
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("libphoenix_nommu"))', 'cfg(target_os, values("phoenix"))'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
