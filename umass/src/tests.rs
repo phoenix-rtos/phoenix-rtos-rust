@@ -1,7 +1,7 @@
 //! Host tests: a mock SCSI device behind the bulk pipes.
 
 use crate::bot::{self, BulkPipes, Bot, Data, Status, CBW_LEN, CSW_LEN};
-use crate::device::{Attached, Device, Location, MAX_TRANSFER};
+use crate::device::{Attached, Device, Location, ReadCache, MAX_TRANSFER};
 use crate::fs::{Filesystem, Filesystems, Mounted, MountedFs};
 use crate::mbr::{self, MbrError, Partition};
 use crate::registry::Registry;
@@ -177,7 +177,7 @@ fn probe(mock: Mock) -> Result<(Device, Log)> {
     let log = mock.log.clone();
     let pipes: Box<dyn BulkPipes> = Box::new(mock);
     let (scsi, part) = Attached::new(pipes).init()?.partition()?;
-    Ok((Device::new(7, location(), scsi, part), log))
+    Ok((Device::new(7, location(), scsi, part, None), log))
 }
 
 // --- transport ---
@@ -338,8 +338,8 @@ fn out_of_bounds_requests_are_refused() {
 
 #[test]
 fn requests_are_cut_to_the_transfer_limit() {
-    let (dev, _) = probe(Mock::new(disk(0x83, 1, 16, 20))).unwrap();
-    let mut buf = vec![0u8; 12 * SECTOR];
+    let (dev, _) = probe(Mock::new(disk(0x83, 1, 48, 50))).unwrap();
+    let mut buf = vec![0u8; 40 * SECTOR];
     assert_eq!(dev.read(0, &mut buf), Ok(MAX_TRANSFER));
 }
 
@@ -349,7 +349,7 @@ fn partitions_past_4_gib() {
     let part = Partition { kind: 0x83, start: 1, sectors: 1 << 24 };
     let mock = Mock::new(disk(0x83, 1, 4, 8));
     let log = mock.log.clone();
-    let dev = Device::new(0, location(), Scsi::new(Box::new(mock) as Box<dyn BulkPipes>), part);
+    let dev = Device::new(0, location(), Scsi::new(Box::new(mock) as Box<dyn BulkPipes>), part, None);
     assert_eq!(dev.size(), 8 << 30);
     let mut buf = vec![0u8; SECTOR];
     let offset = 5i64 << 30;
@@ -358,7 +358,7 @@ fn partitions_past_4_gib() {
     assert_eq!(log.lock().unwrap()[0], (0x28, 0, 1 + (offset / SECTOR as i64) as u32));
 
     let end = Partition { kind: 0x83, start: u32::MAX - 1, sectors: 8 };
-    let dev = Device::new(0, location(), Scsi::new(Box::new(Mock::new(Vec::new())) as Box<dyn BulkPipes>), end);
+    let dev = Device::new(0, location(), Scsi::new(Box::new(Mock::new(Vec::new())) as Box<dyn BulkPipes>), end, None);
     assert_eq!(dev.read(4 * SECTOR as i64, &mut buf), Err(Errno::EINVAL), "LBA past 32 bits");
 }
 
@@ -369,6 +369,104 @@ fn unplugged_device_fails_requests() {
     assert!(dev.is_gone());
     assert_eq!(dev.read(0, &mut [0u8; SECTOR]), Err(Errno::ENODEV));
     assert_eq!(dev.write(0, &[0u8; SECTOR]), Err(Errno::ENODEV));
+}
+
+// --- read cache ---
+
+/// Lines of `line` bytes, kept forever, up to `limit`.
+struct TestCache {
+    line: u64,
+    limit: u64,
+    lines: std::collections::HashMap<u64, Vec<u8>>,
+}
+
+impl ReadCache for TestCache {
+    fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    fn read(&mut self, offset: u64, buf: &mut [u8], fetch: &mut dyn FnMut(u64, &mut [u8]) -> Result<usize>) -> Result<usize> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let base = at - at % self.line;
+            if !self.lines.contains_key(&base) {
+                let mut line = vec![0u8; self.line as usize];
+                assert_eq!(fetch(base, &mut line)?, line.len());
+                self.lines.insert(base, line);
+            }
+            let line = &self.lines[&base];
+            let skip = (at - base) as usize;
+            let n = (line.len() - skip).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&line[skip..skip + n]);
+            done += n;
+        }
+        Ok(done)
+    }
+
+    fn invalidate(&mut self, offset: u64, len: u64) {
+        let line = self.line;
+        self.lines.retain(|&base, _| base + line <= offset || base >= offset + len);
+    }
+}
+
+/// A device on a disk with one partition of `sectors` from sector 2, cached
+/// in lines of two sectors up to `limit`.
+fn cached(sectors: u32, limit: u64) -> (Device, Log) {
+    let mock = Mock::new(disk(0x83, 2, sectors, 2 + sectors as usize + 2));
+    let log = mock.log.clone();
+    let pipes: Box<dyn BulkPipes> = Box::new(mock);
+    let (scsi, part) = Attached::new(pipes).init().unwrap().partition().unwrap();
+    let cache = TestCache { line: 2 * SECTOR as u64, limit, lines: Default::default() };
+    (Device::new(0, location(), scsi, part, Some(Box::new(cache))), log)
+}
+
+fn reads(log: &Log) -> Vec<u32> {
+    log.lock().unwrap().iter().filter(|&&(op, _, _)| op == 0x28).map(|&(_, _, lba)| lba).collect()
+}
+
+#[test]
+fn cached_reads_fetch_whole_lines_once() {
+    let (dev, log) = cached(8, u64::MAX);
+    let before = reads(&log).len();
+    let mut buf = vec![0u8; SECTOR];
+    assert_eq!(dev.read(0, &mut buf), Ok(SECTOR));
+    assert!(buf.iter().all(|&b| b == 2), "partition sector 0 is disk sector 2");
+    assert_eq!(dev.read(SECTOR as i64, &mut buf), Ok(SECTOR));
+    assert!(buf.iter().all(|&b| b == 3));
+    assert_eq!(reads(&log)[before..], [2], "one READ for the line of both sectors");
+}
+
+#[test]
+fn writes_bypass_the_cache_and_invalidate_it() {
+    let (dev, log) = cached(8, u64::MAX);
+    let mut buf = vec![0u8; SECTOR];
+    dev.read(SECTOR as i64, &mut buf).unwrap();
+    assert_eq!(dev.write(SECTOR as i64, &[0x5a; SECTOR]), Ok(SECTOR));
+    dev.read(SECTOR as i64, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x5a), "the write is seen");
+    let lines: Vec<u32> = reads(&log).into_iter().filter(|&lba| lba == 2).collect();
+    assert_eq!(lines.len(), 2, "the line was fetched again");
+}
+
+#[test]
+fn line_past_the_partition_end_is_zeros() {
+    // 3 sectors: the second line has one sector inside and one past the end
+    let (dev, log) = cached(3, u64::MAX);
+    let mut buf = vec![0xffu8; SECTOR];
+    assert_eq!(dev.read(2 * SECTOR as i64, &mut buf), Ok(SECTOR));
+    assert!(buf.iter().all(|&b| b == 4), "partition sector 2 is disk sector 4");
+    assert_eq!(reads(&log).last(), Some(&4), "only the sector inside was read");
+}
+
+#[test]
+fn reads_past_the_cache_limit_bypass_it() {
+    let (dev, log) = cached(8, 2 * SECTOR as u64);
+    let mut buf = vec![0u8; SECTOR];
+    for _ in 0..2 {
+        assert_eq!(dev.read(4 * SECTOR as i64, &mut buf), Ok(SECTOR));
+    }
+    assert_eq!(reads(&log).iter().filter(|&&lba| lba == 6).count(), 2, "not cached");
 }
 
 // --- registry ---

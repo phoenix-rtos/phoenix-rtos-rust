@@ -5,6 +5,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod cache;
 #[cfg(feature = "ext2")]
 pub mod ext2;
 pub mod posix;

@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Mounts ext2 through the C libext2, which has to be linked in (the Makefile
 # does on ia32, as the C driver's UMASS_MOUNT_EXT2)
 ext2 = []
+# Registers as a driver of the USB server, which links the crate as a static
+# library (libusbdrv-umass-rs) instead of running it as a process
+in-server = []
 # Logs the driver threads' deepest stack use every few seconds, for sizing
 # them (i386: relies on there being no red zone)
 stack-report = []

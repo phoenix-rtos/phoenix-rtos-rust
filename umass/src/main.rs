@@ -19,22 +19,22 @@ fn main() -> ExitCode {
     const USB_PRIO: i32 = 4;
     const USB_THREADS: u32 = 1;
 
-    let mut mount_root = false;
+    let mut auto_mount = umass::driver::AutoMount::Nothing;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "-r" => mount_root = true,
+            "-r" => auto_mount = umass::driver::AutoMount::Root,
             _ => {
                 eprintln!("Usage: umass-rs [opts]\n  -r   Mount as rootfs\n  -h   Print this help");
                 return if arg == "-h" { ExitCode::SUCCESS } else { ExitCode::FAILURE };
             }
         }
     }
-    if !mount_root {
+    if auto_mount != umass::driver::AutoMount::Root {
         while phoenix::msg::lookup("/").is_err() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    match umass::driver::start(mount_root) {
+    match umass::driver::start(auto_mount) {
         Ok(driver) => umass::sys::usb::run(driver, USB_PRIO, USB_THREADS),
         Err(e) => {
             eprintln!("umass: failed to start: {e}");

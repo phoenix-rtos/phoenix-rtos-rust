@@ -1,6 +1,10 @@
-//! libusb, process-driver variant: the driver's description, the event
-//! callbacks, and pipes to an inserted device (`usbdriver.h`,
-//! `usbprocdriver.h`).
+//! libusb: the driver's description, the event callbacks, and pipes to an
+//! inserted device (`usbdriver.h`, `usbprocdriver.h`).
+//!
+//! Two variants: a process driver ([`run`]), or, with the `in-server`
+//! feature, a static library the USB server links, registered by a
+//! constructor like the C drivers and started by the server's `ops.init`.
+//! Transfers go through the `pipeOps` the host sets either way.
 //!
 //! The USB server owns the host controller and copies transfer data through
 //! its own DMA memory, so a transfer here only lends a buffer for the
@@ -123,6 +127,8 @@ unsafe extern "C" {
     fn usb_open(drv: *mut UsbDriver, dev: *mut DevInfo, kind: c_int, dir: c_int) -> c_int;
     fn usb_setConfiguration(drv: *mut UsbDriver, pipe: c_uint, conf: c_int) -> c_int;
     fn usb_transferBulk(drv: *mut UsbDriver, pipe: c_uint, data: *mut c_void, size: usize, dir: c_int) -> c_int;
+    #[cfg(feature = "in-server")]
+    fn usb_driverRegister(drv: *mut UsbDriver);
 }
 
 /// What the driver does with the events.
@@ -157,18 +163,17 @@ static FILTERS: Filters = Filters([DeviceId {
 
 static HANDLER: OnceLock<&'static dyn Handler> = OnceLock::new();
 
-/// Connects to the USB server and handles its events on `threads` threads
-/// (this one among them) at priority `prio`. Does not return.
-pub fn run(handler: &'static dyn Handler, prio: i32, threads: u32) -> ! {
-    if HANDLER.set(handler).is_err() {
-        panic!("usb::run called twice");
-    }
+/// The driver's description; libusb links it into its list and the host
+/// sets `pipe_ops`.
+const fn description() -> UsbDriver {
     let mut name = [0 as c_char; DRVNAME_MAX];
-    for (dst, &src) in name.iter_mut().zip(b"umass") {
-        *dst = src as c_char;
+    let src = b"umass";
+    let mut i = 0;
+    while i < src.len() {
+        name[i] = src[i] as c_char;
+        i += 1;
     }
-    // libusb links and writes it (pipe_ops), and keeps it for good: leaked.
-    let drv = Box::leak(Box::new(UsbDriver {
+    UsbDriver {
         next: core::ptr::null_mut(),
         prev: core::ptr::null_mut(),
         name,
@@ -179,7 +184,17 @@ pub fn run(handler: &'static dyn Handler, prio: i32, threads: u32) -> ! {
         nfilters: FILTERS.0.len() as c_uint,
         priv_: core::ptr::null_mut(),
         host_priv: core::ptr::null_mut(),
-    }));
+    }
+}
+
+/// Connects to the USB server and handles its events on `threads` threads
+/// (this one among them) at priority `prio`. Does not return.
+pub fn run(handler: &'static dyn Handler, prio: i32, threads: u32) -> ! {
+    if HANDLER.set(handler).is_err() {
+        panic!("usb::run called twice");
+    }
+    // libusb keeps it for good: leaked.
+    let drv = Box::leak(Box::new(description()));
     // SAFETY: `drv` is a valid, leaked (so 'static) driver whose callbacks
     // match the C signatures; libusb is its only user from here on.
     unsafe { usb_driverProcRun(drv, prio, threads, core::ptr::null_mut()) }
@@ -189,9 +204,58 @@ fn handler() -> &'static dyn Handler {
     *HANDLER.get().expect("set before usb_driverProcRun()")
 }
 
-/// The driver's state lives in Rust; there is nothing to set up.
+/// In a process, [`run`] has started the driver already. In the USB server
+/// this is the start: the first device inserted is mounted on `/mnt`.
 unsafe extern "C" fn on_init(_: *mut UsbDriver, _: *mut c_void) -> c_int {
+    #[cfg(feature = "in-server")]
+    if HANDLER.get().is_none() {
+        match crate::driver::start(crate::driver::AutoMount::At("/mnt".into())) {
+            Ok(driver) => {
+                let _ = HANDLER.set(driver);
+            }
+            Err(e) => return -e.code(),
+        }
+    }
     0
+}
+
+/// The in-server variant's driver, registered before `main`: static, as
+/// nothing may be allocated yet.
+#[cfg(feature = "in-server")]
+mod in_server {
+    use super::{description, usb_driverRegister, UsbDriver};
+    use core::cell::UnsafeCell;
+
+    struct Driver(UnsafeCell<UsbDriver>);
+
+    // SAFETY: only libusb touches it: usb_driverRegister() links it before
+    // main, and the server pops it and copies it into its own state.
+    unsafe impl Sync for Driver {}
+
+    static DRIVER: Driver = Driver(UnsafeCell::new(description()));
+
+    unsafe extern "C" fn register() {
+        // SAFETY: `DRIVER` is static and nothing else holds a reference to it.
+        unsafe { usb_driverRegister(DRIVER.0.get()) };
+    }
+
+    /// A constructor, like the C drivers' `__attribute__((constructor))`.
+    #[used]
+    #[link_section = ".init_array"]
+    static REGISTER: unsafe extern "C" fn() = register;
+}
+
+/// Stack for handling an event: the USB server delivers them on its hub
+/// thread, which has 4 KiB (`hub.c`); probing and a root mount take more.
+const EVENT_STACK: usize = 8 * 1024;
+
+/// Runs `f` on a thread of its own and waits for it.
+fn on_own_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T> {
+    std::thread::scope(|s| {
+        let h = std::thread::Builder::new().name("umass-event".into()).stack_size(EVENT_STACK).spawn_scoped(s, f)?;
+        Ok(h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+    })
+    .map_err(|e: std::io::Error| Errno::from(e))
 }
 
 unsafe extern "C" fn on_destroy(_: *mut UsbDriver) -> c_int {
@@ -210,7 +274,8 @@ unsafe extern "C" fn on_insertion(drv: *mut UsbDriver, info: *mut DevInfo, event
     // SAFETY: libusb passes a device description valid for the call; it is
     // copied out.
     let info = unsafe { *info.as_ptr() };
-    match handler().insert(UsbDevice { drv, info }) {
+    let dev = UsbDevice { drv, info };
+    match on_own_stack(move || handler().insert(dev)).and_then(|r| r) {
         Ok(inserted) => {
             let mut path = [0 as c_char; DEVPATH_MAX];
             for (dst, &src) in path.iter_mut().take(DEVPATH_MAX - 1).zip(inserted.path.as_bytes()) {
@@ -231,8 +296,11 @@ unsafe extern "C" fn on_deletion(_: *mut UsbDriver, del: *mut Deletion) -> c_int
     };
     // SAFETY: libusb passes a deletion event valid for the call.
     let del = unsafe { del.as_ref() };
-    handler().delete(Location { bus: del.bus, dev: del.dev, interface: del.interface });
-    0
+    let at = Location { bus: del.bus, dev: del.dev, interface: del.interface };
+    match on_own_stack(move || handler().delete(at)) {
+        Ok(()) => 0,
+        Err(e) => -e.code(),
+    }
 }
 
 /// An inserted device, for the duration of its insertion handling.
@@ -240,6 +308,11 @@ pub struct UsbDevice {
     drv: NonNull<UsbDriver>,
     info: DevInfo,
 }
+
+// SAFETY: `drv` is the host's copy of the driver, which lives as long as the
+// process and is only read; `info` is a copy. Handled on another thread while
+// the host's thread waits (`on_own_stack`).
+unsafe impl Send for UsbDevice {}
 
 impl UsbDevice {
     pub fn location(&self) -> Location {

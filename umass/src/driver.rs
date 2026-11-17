@@ -11,16 +11,16 @@
 //! the inner ones.
 
 use crate::bot::BulkPipes;
-use crate::device::{Attached, Device, Location};
+use crate::device::{Attached, Device, Location, ReadCache, MAX_TRANSFER};
 use crate::fs::{BlockIo, Filesystem, Filesystems, Mounted};
 use crate::registry::Registry;
 use crate::sys;
 use crate::sys::usb::{Handler, Inserted, UsbDevice};
 use phoenix::msg::raw::MT_UMOUNT;
-use phoenix::msg::{AttrType, Port, Received, Reply, Request};
+use phoenix::msg::{AttrType, Mount, Port, Received, Reply, Request};
 use phoenix::{Errno, Id, Oid, Result};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -34,6 +34,20 @@ const POOL_THREADS: usize = 2;
 const MSG_STACK: usize = 4 * 1024;
 const RECEIVER_STACK: usize = 4 * 1024;
 const POOL_STACK: usize = 4 * 1024;
+/// Lines of a device's read cache, each `MAX_TRANSFER` bytes: 128 KiB.
+const CACHE_LINES: usize = 8;
+/// Waits for the mount point, then mounts on it (`Mount::new`: path lookups).
+const AUTO_MOUNT_STACK: usize = 8 * 1024;
+
+/// What to do with the first device inserted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoMount {
+    Nothing,
+    /// Mount its partition as the root filesystem.
+    Root,
+    /// Mount its partition on this directory, once it exists.
+    At(PathBuf),
+}
 
 macro_rules! log {
     ($($arg:tt)*) => { println!("umass: {}", format_args!($($arg)*)) };
@@ -74,8 +88,10 @@ pub struct Driver {
     mounts: Mutex<BTreeMap<Id, Arc<Partition>>>,
     tokens: Mutex<Tokens>,
     filesystems: OnceLock<Filesystems>,
-    /// Mount the next device inserted as the root filesystem.
-    mount_root: AtomicBool,
+    /// Taken by the first device mounted.
+    auto_mount: Mutex<AutoMount>,
+    /// Mounts made by `AutoMount::At`, kept for good.
+    auto_mounted: Mutex<Vec<Mount>>,
     jobs: Sender<Job>,
 }
 
@@ -83,7 +99,7 @@ static DRIVER: OnceLock<Driver> = OnceLock::new();
 
 /// Creates the driver and starts its threads; then [`sys::usb::run`] feeds
 /// it USB events.
-pub fn start(mount_root: bool) -> Result<&'static Driver> {
+pub fn start(auto_mount: AutoMount) -> Result<&'static Driver> {
     let port = Port::new()?;
     let (jobs, queue) = mpsc::channel();
     let driver = Driver {
@@ -92,7 +108,8 @@ pub fn start(mount_root: bool) -> Result<&'static Driver> {
         mounts: Mutex::default(),
         tokens: Mutex::new(Tokens { next: 0, devices: BTreeMap::new() }),
         filesystems: OnceLock::new(),
-        mount_root: AtomicBool::new(mount_root),
+        auto_mount: Mutex::new(auto_mount),
+        auto_mounted: Mutex::default(),
         jobs,
     };
     if DRIVER.set(driver).is_err() {
@@ -266,6 +283,51 @@ impl Driver {
     }
 }
 
+impl Driver {
+    /// Mounts a newly inserted device as `auto_mount` says, if no device has
+    /// been yet; a device that cannot be mounted leaves it to the next one.
+    fn auto_mount(&self, dev: &Arc<Device>, path: &str) {
+        let mut auto = lock(&self.auto_mount);
+        match &*auto {
+            AutoMount::Nothing => {}
+            AutoMount::Root => match self.mount(dev, None).and_then(|root| sys::posix::register("/", root)) {
+                Ok(()) => {
+                    log!("{path} mounted as the root filesystem");
+                    *auto = AutoMount::Nothing;
+                }
+                Err(e) => log_error!("mounting {path} as the root filesystem failed: {e}"),
+            },
+            AutoMount::At(dir) => match self.mount(dev, None) {
+                Ok(root) => {
+                    // the directory is in the root filesystem, which may not be
+                    // up yet: waited for elsewhere, not holding up the USB events
+                    let (dir, name) = (dir.clone(), path.to_string());
+                    let attach = move || DRIVER.get().expect("started").attach(&dir, root, &name);
+                    match spawn("umass-automount", AUTO_MOUNT_STACK, attach) {
+                        Ok(()) => *auto = AutoMount::Nothing,
+                        Err(e) => log_error!("mounting {path} failed: {e}"),
+                    }
+                }
+                Err(e) => log_error!("mounting {path} failed: {e}"),
+            },
+        }
+    }
+
+    /// Mounts the filesystem `root` on `dir` once `dir` exists.
+    fn attach(&self, dir: &std::path::Path, root: Oid, path: &str) {
+        while !dir.is_dir() {
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        match Mount::new(dir, root) {
+            Ok(mount) => {
+                log!("{path} mounted on {}", dir.display());
+                lock(&self.auto_mounted).push(mount);
+            }
+            Err(e) => log_error!("mounting {path} on {} failed: {e}", dir.display()),
+        }
+    }
+}
+
 /// A partition's receiving thread: passes its messages to the pool until the
 /// port is closed.
 fn receive(part: Arc<Partition>, jobs: Sender<Job>) {
@@ -311,19 +373,21 @@ impl Handler for Driver {
         log!("{} {} (device type {:#x})", ready.inquiry.vendor, ready.inquiry.product, ready.inquiry.device_type);
         let (scsi, part) = ready.partition().inspect_err(|e| log_error!("no usable MBR partition: {e}"))?;
 
-        let dev = Arc::new(Device::new(id, usb.location(), scsi, part));
+        let cache = match sys::cache::LineCache::new(part.size(), MAX_TRANSFER, CACHE_LINES) {
+            Ok(cache) => Some(Box::new(cache) as Box<dyn ReadCache>),
+            Err(e) => {
+                log_error!("no read cache ({e}): reading uncached");
+                None
+            }
+        };
+        let dev = Arc::new(Device::new(id, usb.location(), scsi, part, cache));
         let path = format!("/dev/umass{id}");
         let oid = self.port.oid(id);
         sys::posix::create_device(oid, &path).inspect_err(|e| log_error!("creating {path} failed: {e}"))?;
         slot.fill(dev.clone());
         log!("New USB Mass Storage device: {path} sectors: {}", part.sectors);
 
-        if self.mount_root.load(Ordering::SeqCst) {
-            match self.mount(&dev, None).and_then(|root| sys::posix::register("/", root)) {
-                Ok(()) => self.mount_root.store(false, Ordering::SeqCst),
-                Err(e) => log_error!("mounting {path} as the root filesystem failed: {e}"),
-            }
-        }
+        self.auto_mount(&dev, &path);
         Ok(Inserted { oid, path })
     }
 

@@ -6,9 +6,13 @@ direct-access devices on the Bulk-Only Transport, each as `/dev/umassN`, whose
 first MBR partition can be mounted (`mtMount`) or mounted as the root
 filesystem (`-r`).
 
-For now it is a USB **process driver** only, built as `umass-rs` on ia32 next
-to the C `umass`. ia32 still runs the C driver linked into the USB server
-(`libusbdrv-umass`).
+It builds both ways the C driver does, on ia32:
+
+- **`umass-rs`**, a USB process driver, next to the C `umass`;
+- **`libusbdrv-umass-rs`**, a static library the USB server links like the C
+  `libusbdrv-umass` (feature `in-server`). The ia32 core build links it
+  instead of the C one with `UMASS_RUST=y RUST_ENABLE=y`; `USB_HOSTDRV_LIBS=`
+  links no driver into the server, for running `umass-rs` as a process.
 
 ## Layout
 
@@ -104,10 +108,25 @@ Line numbers are `umass.c`'s.
   after creating `/dev/umassN` (917-922), reporting a failed insertion for a
   device that had been created. It is logged; the device stays usable.
 - **Messages to an unmounted partition** get `ENOENT`.
+- **Reads are cached, with read-ahead.** libext2 reads a block per request,
+  each a SCSI command of three USB transfers. Each device has a read cache
+  (libcache, `sys/cache.rs`): 8 lines of 16 KiB, 128 KiB per device; a miss
+  reads the whole line in one command. Writes go to the device as before and
+  invalidate what the cache holds of them: libcache's write-through writes
+  back a whole line, which would turn every block written into 16 KiB read and
+  16 KiB written. Past 4 GiB, which libcache cannot address on 32-bit targets,
+  reads bypass the cache.
+- **Requests are cut to 16 KiB**, a cache line, rather than C's 4 KiB.
+- **In the USB server, the first device is mounted on `/mnt`**, not as the
+  root filesystem: the C driver, given no arguments there, mounts it as `/`
+  (`umass_init()`, 969-974), replacing the root of a system booted from
+  another disk. The partition is mounted at insertion, and attached to `/mnt`
+  by a thread of its own once `/mnt` exists, as the USB server starts before
+  the root filesystem. `umass-rs -r` still mounts it as `/`.
 
 ## Kept
 
-The first partition only; LUN 0 only; requests cut to 4 KiB; no data stage
+The first partition only; LUN 0 only; no data stage
 (and for a 0-byte request, no command at all) when there is no data; three tries of a
 failed command with REQUEST SENSE between; ten rounds of TEST UNIT READY +
 INQUIRY at insertion; two message and two pool threads; `/dev/umassN` names
@@ -115,29 +134,50 @@ with the lowest free N; `-r`; waiting for `/` otherwise.
 
 ## Not done (TODO)
 
-- **The in-server variant** (`libusbdrv-umass`, linked into the USB server) is
-  C only: this is a process driver.
 - **Reset recovery.** A phase error or an invalid status wrapper should be
   followed by a Bulk-Only Mass Storage Reset and clearing both bulk endpoints'
   halt; that needs the endpoint addresses, which libusb's pipes do not expose.
   Such a command fails with `EIO`, as in C.
+- **The in-server variant crashes the USB server at the first insertion.**
+  The server delivers events on threads it starts with `beginthread()`, which
+  have no pthread context; handling the event spawns a thread through std,
+  which registers the calling thread in a thread-local, and libphoenix's
+  `pthread_setspecific()` dereferences the missing context (`ISSUES.md`).
+  Until libphoenix handles that, the event thread has to be created with
+  `pthread_create()` directly, using nothing of std on the server's thread.
 - **Pipes are never closed**: libusb has no call for it; the USB server frees
   a device's pipes when it goes away.
 - **Thread priorities.** The C threads ran at priority 4; the Rust ones run
   at the default.
 - **Thread stacks** are 4 KiB (one page) each, from a static estimate on
   ia32 (call graph and frame sizes read from the release binary, indirect
-  calls resolved from the source): ~1.3 KB for the message threads, ~1.7 KB
-  for the pool, ~1 KB for partition receivers. Formatting and panic paths are
-  bounded only loosely, below 6 KB: printing an error or a panic message on
-  these threads could exceed a page, and with no guard page that would
-  silently corrupt memory below the stack. Not yet confirmed by a measurement
+  calls resolved from the source): an ext2 request down to the USB transfer,
+  through the read cache, is ~2.0 KB on a pool thread; with every formatting
+  and panic path counted (an over-approximation), ~3 KB for each thread. Not yet confirmed by a measurement
   on a device: build with `UMASS_FEATURES="ext2 stack-report"` and the driver
   logs each thread's deepest stack use every few seconds.
 - **Targets.** Built on ia32 only, where libusb and libext2 are; the C driver
   also runs on armv7a7-imx6ull.
 - **On target**: not yet run against a device (QEMU's `usb-storage`), see the
   section below once it is.
+
+## The in-server variant
+
+- **Registration**: a constructor (an `.init_array` entry, as the C driver's
+  `__attribute__((constructor))`) passes a static driver description to
+  `usb_driverRegister()`; nothing is allocated before `main`. The server's
+  `ops.init` then starts the driver, which mounts the first device inserted on
+  `/mnt` (see below).
+- **Stacks**: the server delivers insertion and deletion on its hub thread,
+  whose stack is 4 KiB (`usb/hub.c`). Probing, logging and a root mount could
+  outgrow it, so each event is handled on a thread of its own (8 KiB) while
+  the hub thread waits.
+- **Linking**: built with `cargo rustc --crate-type staticlib`
+  (`phoenix-rtos-build/makes/rust-static-lib.mk`); the archive holds std and
+  the driver as one LTO object, and leaves libusb, libext2 and libphoenix to
+  the server's link. A program can link only one Rust static library.
+- **Size** (ia32, stripped, text + bss added to the USB server): 125 KB,
+  against 99 KB for the C driver (29 KB of code, 70 KB of static stacks).
 
 ## Verification
 
@@ -150,4 +190,6 @@ with the lowest free N; `-r`; waiting for `/` otherwise.
   `driver`, Phoenix-only).
 - `cargo check` for all seven Phoenix targets, with and without `ext2`.
 - Built and linked in the ia32 project build (`make -C phoenix-rtos-rust
-  umass-rs`), with libusb and libext2.
+  umass-rs`), with libusb and libext2; the in-server library linked into the
+  USB server (`make -C phoenix-rtos-usb usb USB_HOSTDRV_LIBS="libusbdrv-umass-rs
+  libext2"`).
